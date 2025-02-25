@@ -10,6 +10,7 @@ import { Register } from './pages/register';
 import { Recipes } from './pages/recipes';
 import { Discover } from './pages/discover';
 import { Pantry } from './pages/pantry';
+import { Calendar } from './pages/calendar';
 
 function App() {
   return (
@@ -24,6 +25,7 @@ function App() {
             <Route path="/inventory" element={<Inventory />} />
             <Route path="/pantry" element={<Pantry />} />
             <Route path="/recipes" element={<Recipes />} />
+            <Route path="/calendar" element={<Calendar />} />
             <Route path="/discover" element={<Discover />} />
           </Route>
         </Routes>

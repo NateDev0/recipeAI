@@ -3,7 +3,7 @@ import { ChefHat, Clock, Filter, Search, SlidersHorizontal, Star, Users, Refresh
 import { Button } from '../components/ui/button';
 import { RecipeDetail } from '../components/ui/recipe-detail';
 import { supabase } from '../lib/supabase';
-import { searchRecipes, getRandomRecipes } from '../lib/mealdb';
+import { generateRecipe } from '../lib/gemini';
 import { useAuth } from '../contexts/auth-context';
 import type {
   Recipe,
@@ -206,68 +206,11 @@ export function Recipes() {
       if (error) throw error;
 
       setPantryItems(data || []);
-      
-      // After getting pantry items, fetch recipes
-      if (data && data.length > 0) {
-        await fetchRecipes();
-      }
     } catch (err) {
       console.error('Error fetching pantry items:', err);
       setError('Failed to fetch pantry items');
     } finally {
       setLoadingPantry(false);
-    }
-  };
-
-  const fetchRecipes = async () => {
-    setLoading(true);
-    setError(null);
-    setHasSearched(true);
-    
-    try {
-      // Get ingredients from pantry
-      const availableIngredients = pantryItems
-        .filter(item => item.current_quantity > 0)
-        .map(item => item.name);
-
-      if (availableIngredients.length === 0) {
-        setError('No ingredients available in your pantry');
-        setAllRecipes([]);
-        return;
-      }
-
-      // Fetch a large batch of recipes
-      const results = await Promise.all([
-        ...availableIngredients.map(ingredient => searchRecipes(ingredient)),
-        getRandomRecipes()
-      ]);
-
-      // Flatten and deduplicate recipes
-      const uniqueRecipes = Array.from(
-        new Map(
-          results.flat().map(recipe => [recipe.id, recipe])
-        ).values()
-      );
-
-      // Match ingredients and sort by match score
-      const matchedRecipes = uniqueRecipes
-        .map(recipe => matchRecipeIngredients(recipe, pantryItems))
-        .sort((a, b) => b.matchScore - a.matchScore);
-
-      setAllRecipes(matchedRecipes);
-      setPage(1); // Reset to first page
-    } catch (err) {
-      console.error('Error fetching recipes:', err);
-      setError('Failed to fetch recipes');
-      setAllRecipes([]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadMore = () => {
-    if (visibleRecipes.length < allRecipes.length) {
-      setPage(prev => prev + 1);
     }
   };
 
@@ -295,6 +238,219 @@ export function Recipes() {
         filtersRef.current.scrollTop = scrollPos;
       }
     });
+  };
+
+  const fetchRecipes = async () => {
+    setLoading(true);
+    setError(null);
+    setHasSearched(true);
+    
+    try {
+      // Get ingredients from pantry
+      const availableIngredients = pantryItems
+        .filter(item => item.current_quantity > 0)
+        .map(item => item.name);
+
+      if (availableIngredients.length === 0) {
+        setError('No ingredients available in your pantry');
+        setAllRecipes([]);
+        return;
+      }
+
+      // Get current preset settings if any
+      const currentPreset = DIETARY_PRESETS.find(preset => preset.value === activePreset);
+      const effectiveFilters = currentPreset ? { ...filters, ...currentPreset.settings } : filters;
+
+      // Generate recipes sequentially to avoid rate limits
+      const generatedRecipes: RecipeWithMatch[] = [];
+      const TOTAL_RECIPES = 10;
+      const MIN_MATCH_SCORE = 60;
+      let attempts = 0;
+      const MAX_ATTEMPTS = 20; // Prevent infinite loops
+
+      for (let i = 0; i < TOTAL_RECIPES && attempts < MAX_ATTEMPTS; i++) {
+        try {
+          // Add a small delay between requests
+          if (attempts > 0) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+
+          // Always try for 100% first, then gradually reduce requirements
+          const attemptNumber = attempts - (Math.floor(attempts / TOTAL_RECIPES) * TOTAL_RECIPES);
+          const minRequiredIngredients = Math.max(
+            Math.ceil(availableIngredients.length * (1 - (attemptNumber * 0.1))),
+            Math.ceil(availableIngredients.length * (MIN_MATCH_SCORE / 100))
+          );
+          
+          // Select ingredients based on current attempt
+          const selectedIngredients = availableIngredients.slice(0, minRequiredIngredients);
+          
+          // Track previously generated recipe titles to avoid duplicates and similar variations
+          const previousRecipeTitles = generatedRecipes.map(recipe => recipe.title);
+
+          const recipe = await generateRecipe(selectedIngredients, {
+            cuisine: effectiveFilters.cuisineType,
+            difficulty: effectiveFilters.skillLevel,
+            dietaryRestrictions: effectiveFilters.dietaryRestrictions,
+            requireAllIngredients: true,
+            maxCookingTime: effectiveFilters.cookingTime,
+            maxIngredients: effectiveFilters.maxIngredients,
+            previousRecipes: previousRecipeTitles // Pass the list of previously generated recipes
+          });
+
+          const processedRecipe = matchRecipeIngredients(recipe, pantryItems);
+          
+          // Only accept recipes that match our criteria
+          const meetsTimeLimit = !effectiveFilters.cookingTime || recipe.cookingTime <= effectiveFilters.cookingTime;
+          const meetsIngredientLimit = !effectiveFilters.maxIngredients || recipe.ingredients.length <= effectiveFilters.maxIngredients;
+          
+          // Check if the recipe is too similar to existing recipes (additional check for redundancy)
+          const isTooSimilar = generatedRecipes.some(existingRecipe => {
+            // More rigorous title similarity check
+            const normalizeTitle = (title: string) => {
+              return title.toLowerCase()
+                .replace(/\b(quick|simple|easy|fast|basic|speedy|cheesy|tasty|delicious|homemade|classic|traditional)\b/g, '')
+                .trim();
+            };
+            
+            const normalizedNewTitle = normalizeTitle(recipe.title);
+            const normalizedExistingTitle = normalizeTitle(existingRecipe.title);
+            
+            // Compare ingredients - significant overlap suggests similar recipe
+            const newIngredientSet = new Set(recipe.ingredients.map(ing => ing.toLowerCase()));
+            const existingIngredientSet = new Set(existingRecipe.ingredients.map(ing => ing.toLowerCase()));
+            
+            // Calculate Jaccard similarity for ingredients (intersection over union)
+            const ingredientIntersection = [...newIngredientSet].filter(ing => {
+              // Check for partial matches in the existing ingredient set
+              return [...existingIngredientSet].some(existIng => 
+                ing.includes(existIng) || existIng.includes(ing)
+              );
+            }).length;
+            
+            const ingredientUnion = newIngredientSet.size + existingIngredientSet.size - ingredientIntersection;
+            const ingredientSimilarity = ingredientIntersection / ingredientUnion;
+            
+            // Compare cooking time - very similar cooking times suggest similar recipes
+            const cookingTimeSimilarity = 1 - Math.abs(recipe.cookingTime - existingRecipe.cookingTime) / 60;
+            
+            // Compare descriptions - similar descriptions often mean similar recipes
+            const descSimilarity = stringSimilarity(
+              recipe.description.toLowerCase(), 
+              existingRecipe.description.toLowerCase()
+            );
+            
+            // Title match conditions
+            const titleMatch = 
+              normalizedNewTitle === normalizedExistingTitle || // Exact match after normalization
+              (normalizedNewTitle.includes(normalizedExistingTitle) && normalizedExistingTitle.length > 5) || // One contains the other
+              (normalizedExistingTitle.includes(normalizedNewTitle) && normalizedNewTitle.length > 5) ||
+              stringSimilarity(normalizedNewTitle, normalizedExistingTitle) > 0.6; // High similarity score
+              
+            // Combined similarity score
+            const overallSimilarity = (
+              (titleMatch ? 0.5 : 0) + 
+              (ingredientSimilarity * 0.3) + 
+              (cookingTimeSimilarity * 0.1) + 
+              (descSimilarity * 0.1)
+            );
+            
+            console.log(`Similarity check - ${recipe.title} vs ${existingRecipe.title}: ${overallSimilarity.toFixed(2)}`);
+            
+            // Consider too similar if overall similarity is high
+            return overallSimilarity > 0.5;
+          });
+          
+          // Helper function to calculate string similarity (0-1 where 1 is identical)
+          function stringSimilarity(str1: string, str2: string): number {
+            if (str1 === str2) return 1.0;
+            if (str1.length === 0 || str2.length === 0) return 0.0;
+            
+            // Count common words
+            const words1 = str1.split(/\s+/);
+            const words2 = str2.split(/\s+/);
+            const wordSet1 = new Set(words1);
+            const wordSet2 = new Set(words2);
+            
+            let commonWords = 0;
+            for (const word of wordSet1) {
+              if (wordSet2.has(word)) commonWords++;
+            }
+            
+            return (2 * commonWords) / (wordSet1.size + wordSet2.size);
+          }
+          
+          if (processedRecipe.matchScore >= MIN_MATCH_SCORE && 
+              meetsTimeLimit && 
+              meetsIngredientLimit && 
+              !isTooSimilar) {
+            generatedRecipes.push(processedRecipe);
+            i++; // Only increment if we got a valid recipe
+          } else if (isTooSimilar) {
+            console.log(`Skipping too similar recipe: ${recipe.title}`);
+            // Don't increment i here, as we're rejecting this recipe
+          }
+
+          attempts++;
+        } catch (error) {
+          console.error(`Error generating recipe (attempt ${attempts + 1}):`, error);
+          attempts++;
+        }
+      }
+
+      if (generatedRecipes.length === 0) {
+        throw new Error('Unable to generate any recipes. Please try again later.');
+      }
+
+      // Sort recipes according to filter settings
+      const sortedRecipes = sortRecipes(generatedRecipes, effectiveFilters.sortBy || 'rating', effectiveFilters.sortOrder || 'desc');
+
+      setAllRecipes(sortedRecipes);
+      setVisibleRecipes(sortedRecipes.slice(0, RECIPES_PER_PAGE));
+    } catch (error) {
+      console.error('Error generating recipes:', error);
+      setError('Failed to generate recipes. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const sortRecipes = (recipes: RecipeWithMatch[], sortBy: RecipeFilters['sortBy'], sortOrder: 'asc' | 'desc') => {
+    return [...recipes].sort((a, b) => {
+      let comparison = 0;
+      switch (sortBy) {
+        case 'time':
+          comparison = a.cookingTime - b.cookingTime;
+          break;
+        case 'difficulty':
+          comparison = getDifficultyScore(a.difficulty) - getDifficultyScore(b.difficulty);
+          break;
+        case 'rating':
+          comparison = b.matchScore - a.matchScore; // Higher match score first
+          break;
+        case 'ingredients':
+          comparison = a.ingredients.length - b.ingredients.length;
+          break;
+        default:
+          comparison = b.matchScore - a.matchScore;
+      }
+      return sortOrder === 'asc' ? comparison : -comparison;
+    });
+  };
+
+  const getDifficultyScore = (difficulty: CookingSkillLevel) => {
+    switch (difficulty) {
+      case 'beginner': return 1;
+      case 'intermediate': return 2;
+      case 'advanced': return 3;
+      default: return 2;
+    }
+  };
+
+  const loadMore = () => {
+    if (visibleRecipes.length < allRecipes.length) {
+      setPage(prev => prev + 1);
+    }
   };
 
   return (
@@ -493,7 +649,9 @@ export function Recipes() {
         {(loading || loadingPantry) ? (
           <div className="text-center py-12">
             <div className="animate-spin rounded-full h-12 w-12 border-4 border-primary border-t-transparent mx-auto"></div>
-            <p className="mt-4 text-gray-500">Finding recipes based on your pantry...</p>
+            <p className="mt-4 text-gray-500">
+              {loadingPantry ? "Loading your pantry..." : "Generating recipe suggestions..."}
+            </p>
           </div>
         ) : error && hasSearched ? (
           <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-md">
@@ -596,9 +754,11 @@ export function Recipes() {
           <div className="text-center py-12">
             <div className="bg-gray-50 rounded-xl p-8 max-w-md mx-auto">
               <ChefHat className="h-12 w-12 text-gray-400 mx-auto mb-4" />
-              <h3 className="text-lg font-medium text-gray-900">Get Recipe Suggestions</h3>
+              <h3 className="text-lg font-medium text-gray-900">Ready to Cook?</h3>
               <p className="mt-2 text-gray-500">
-                Click the "Refresh Suggestions" button to find recipes based on your pantry ingredients
+                {pantryItems.filter(i => i.current_quantity > 0).length === 0 
+                  ? "Add ingredients to your pantry to get started"
+                  : "Click 'Refresh Suggestions' to get AI-powered recipe ideas based on your pantry ingredients"}
               </p>
             </div>
           </div>

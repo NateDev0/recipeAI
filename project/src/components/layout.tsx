@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Navigate, Outlet, Link, useLocation } from 'react-router-dom';
-import { Bot, ChefHat, Sparkles, LogOut, Menu, X, Refrigerator, Search } from 'lucide-react';
+import { Bot, ChefHat, Sparkles, LogOut, Menu, X, Refrigerator, Search, Calendar } from 'lucide-react';
 import { useAuth } from '../contexts/auth-context';
 import { Button } from './ui/button';
 
@@ -39,8 +39,8 @@ export function Layout() {
         }`}
         onClick={() => setIsMobileMenuOpen(false)}
       >
-        <Sparkles className="h-4 w-4 mr-2" />
-        AI Kitchen
+        <Bot className="h-4 w-4 mr-2" />
+        Home
       </Link>
       <Link
         to="/pantry"
@@ -64,7 +64,19 @@ export function Layout() {
         onClick={() => setIsMobileMenuOpen(false)}
       >
         <ChefHat className="h-4 w-4 mr-2" />
-        My Recipes
+        AutoChef
+      </Link>
+      <Link
+        to="/calendar"
+        className={`inline-flex items-center px-1 pt-1 text-sm font-medium ${
+          location.pathname === '/calendar'
+            ? 'text-primary border-b-2 border-primary'
+            : 'text-muted-foreground hover:text-foreground'
+        }`}
+        onClick={() => setIsMobileMenuOpen(false)}
+      >
+        <Calendar className="h-4 w-4 mr-2" />
+        Meal Planner
       </Link>
       <Link
         to="/discover"
